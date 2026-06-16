@@ -398,6 +398,20 @@ class EvolutionTraceConfig:
 
 
 @dataclass
+class OperatorConfig:
+    """Configuration for the operator-selection layer.
+
+    When ``enabled`` is False the controller applies no selection and behaviour
+    is identical to stock OpenEvolve (every iteration uses the default template).
+    """
+
+    enabled: bool = False
+    selector: str = "ucb"  # "random" | "ucb"
+    operator_ids: List[str] = field(default_factory=lambda: ["baseline", "reflect_rewrite"])
+    ucb_c: float = 1.414
+
+
+@dataclass
 class Config:
     """Master configuration for OpenEvolve"""
 
@@ -416,6 +430,7 @@ class Config:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
     evolution_trace: EvolutionTraceConfig = field(default_factory=EvolutionTraceConfig)
+    operators: OperatorConfig = field(default_factory=OperatorConfig)
 
     # Evolution settings
     diff_based_evolution: bool = True

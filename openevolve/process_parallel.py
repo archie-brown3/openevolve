@@ -16,7 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
-from openevolve.utils.metrics_utils import safe_numeric_average
+from openevolve.operators import CostMeter, OperatorPool, build_selector
+from openevolve.utils.metrics_utils import get_fitness_score, safe_numeric_average
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,8 @@ class SerializableResult:
     iteration: int = 0
     error: Optional[str] = None
     target_island: Optional[int] = None  # Island where child should be placed
+    operator_id: Optional[str] = None  # Operator chosen by the selector for this iteration
+    usage: Optional[Dict[str, int]] = None  # Token usage from the worker's LLM call
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -132,7 +135,12 @@ def _lazy_init_worker_components():
 
 
 def _run_iteration_worker(
-    iteration: int, db_snapshot: Dict[str, Any], parent_id: str, inspiration_ids: List[str]
+    iteration: int,
+    db_snapshot: Dict[str, Any],
+    parent_id: str,
+    inspiration_ids: List[str],
+    operator_id: Optional[str] = None,
+    template_key: Optional[str] = None,
 ) -> SerializableResult:
     """Run a single iteration in a worker process"""
     try:
@@ -191,6 +199,7 @@ def _run_iteration_worker(
             program_artifacts=parent_artifacts,
             feature_dimensions=db_snapshot.get("feature_dimensions", []),
             current_changes_description=parent_changes_desc,
+            template_key=template_key,
         )
 
         iteration_start = time.time()
@@ -205,11 +214,23 @@ def _run_iteration_worker(
             )
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
-            return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
+            return SerializableResult(
+                error=f"LLM generation failed: {str(e)}",
+                iteration=iteration,
+                operator_id=operator_id,
+            )
+
+        # Capture token usage from the call just made (None if provider omits it)
+        call_usage = _worker_llm_ensemble.pop_last_usage()
 
         # Check for None response
         if llm_response is None:
-            return SerializableResult(error="LLM returned None response", iteration=iteration)
+            return SerializableResult(
+                error="LLM returned None response",
+                iteration=iteration,
+                operator_id=operator_id,
+                usage=call_usage,
+            )
 
         # Parse response based on evolution mode
         if _worker_config.diff_based_evolution:
@@ -224,7 +245,10 @@ def _run_iteration_worker(
             diff_blocks = extract_diffs(llm_response, _worker_config.diff_pattern)
             if not diff_blocks:
                 return SerializableResult(
-                    error="No valid diffs found in response", iteration=iteration
+                    error="No valid diffs found in response",
+                    iteration=iteration,
+                    operator_id=operator_id,
+                    usage=call_usage,
                 )
 
             if _worker_config.prompt.programs_as_changes_description:
@@ -235,7 +259,12 @@ def _run_iteration_worker(
                         changes_description_text=parent_changes_desc,
                     )
                 except Exception as e:
-                    return SerializableResult(error=str(e), iteration=iteration)
+                    return SerializableResult(
+                        error=str(e),
+                        iteration=iteration,
+                        operator_id=operator_id,
+                        usage=call_usage,
+                    )
 
                 child_code, _ = apply_diff_blocks(parent.code, code_blocks)
                 child_changes_desc, desc_applied = apply_diff_blocks(
@@ -251,6 +280,8 @@ def _run_iteration_worker(
                     return SerializableResult(
                         error="changes_description was not updated or empty, program is discarded",
                         iteration=iteration,
+                        operator_id=operator_id,
+                        usage=call_usage,
                     )
 
                 changes_summary = format_diff_summary(
@@ -272,7 +303,10 @@ def _run_iteration_worker(
             new_code = parse_full_rewrite(llm_response, _worker_config.language)
             if not new_code:
                 return SerializableResult(
-                    error=f"No valid code found in response", iteration=iteration
+                    error=f"No valid code found in response",
+                    iteration=iteration,
+                    operator_id=operator_id,
+                    usage=call_usage,
                 )
 
             child_code = new_code
@@ -283,6 +317,8 @@ def _run_iteration_worker(
             return SerializableResult(
                 error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})",
                 iteration=iteration,
+                operator_id=operator_id,
+                usage=call_usage,
             )
 
         # Evaluate the child program
@@ -325,6 +361,8 @@ def _run_iteration_worker(
             artifacts=artifacts,
             iteration=iteration,
             target_island=target_island,
+            operator_id=operator_id,
+            usage=call_usage,
         )
 
     except Exception as e:
@@ -356,6 +394,27 @@ class ProcessParallelController:
         # Number of worker processes
         self.num_workers = config.evaluator.parallel_evaluations
         self.num_islands = config.database.num_islands
+
+        # Operator-selection layer (parent-process state). When disabled, no operator
+        # is chosen and workers fall through to the default template (template_key=None).
+        op_config = config.operators
+        self.operator_pool: Optional[OperatorPool] = None
+        self.operator_selector = None
+        self.cost_meter: Optional[CostMeter] = None
+        self._pending_operator: Dict[int, str] = {}
+        if op_config.enabled:
+            self.operator_pool = OperatorPool(op_config.operator_ids)
+            self.operator_selector = build_selector(
+                op_config.selector,
+                self.operator_pool.ids(),
+                ucb_c=op_config.ucb_c,
+                seed=config.random_seed,
+            )
+            self.cost_meter = CostMeter()
+            logger.info(
+                f"Operator selection enabled: selector={op_config.selector}, "
+                f"operators={self.operator_pool.ids()}"
+            )
 
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
 
@@ -553,8 +612,19 @@ class ProcessParallelController:
                 timeout_seconds = self.config.evaluator.timeout + 30
                 result = future.result(timeout=timeout_seconds)
 
+                # Operator accounting (parent-side). Meter tokens for every completed
+                # call (success or discard — both were billed) and drop the pending entry.
+                operator_id = result.operator_id
+                self._pending_operator.pop(completed_iteration, None)
+                if operator_id is not None and self.cost_meter is not None:
+                    self.cost_meter.add(operator_id, result.usage)
+
                 if result.error:
                     logger.warning(f"Iteration {completed_iteration} error: {result.error}")
+                    # A discarded attempt still consumed a call: credit the operator with
+                    # zero reward so the bandit does not over-favour failure-prone operators.
+                    if operator_id is not None and self.operator_selector is not None:
+                        self.operator_selector.update(operator_id, 0.0)
                 elif result.child_program_dict:
                     # Reconstruct program from dict
                     child_program = Program(**result.child_program_dict)
@@ -567,6 +637,16 @@ class ProcessParallelController:
                         iteration=completed_iteration,
                         target_island=result.target_island,
                     )
+
+                    # Credit the operator with the fitness gain over its parent.
+                    if operator_id is not None and self.operator_selector is not None:
+                        feature_dims = self.database.config.feature_dimensions
+                        child_fit = get_fitness_score(child_program.metrics, feature_dims)
+                        parent_fit = get_fitness_score(
+                            child_program.metadata.get("parent_metrics", {}), feature_dims
+                        )
+                        self.operator_selector.update(operator_id, child_fit - parent_fit)
+                        child_program.metadata["operator_id"] = operator_id
 
                     # Store artifacts
                     if result.artifacts:
@@ -752,8 +832,10 @@ class ProcessParallelController:
                 )
                 # Cancel the future to clean up the process
                 future.cancel()
+                self._pending_operator.pop(completed_iteration, None)
             except Exception as e:
                 logger.error(f"Error processing result from iteration {completed_iteration}: {e}")
+                self._pending_operator.pop(completed_iteration, None)
 
             completed_iterations += 1
 
@@ -791,6 +873,14 @@ class ProcessParallelController:
         else:
             logger.info("✅ Evolution completed - Maximum iterations reached")
 
+        # Operator-selection summary for analysis
+        if self.operator_selector is not None:
+            stats = getattr(self.operator_selector, "stats", None)
+            if callable(stats):
+                logger.info(f"Operator selector stats: {stats()}")
+        if self.cost_meter is not None:
+            logger.info(f"Operator token totals: {self.cost_meter.totals()}")
+
         return self.database.get_best_program()
 
     def _submit_iteration(
@@ -811,6 +901,14 @@ class ProcessParallelController:
             db_snapshot = self._create_database_snapshot()
             db_snapshot["sampling_island"] = target_island  # Mark which island this is for
 
+            # Choose the operator for this iteration (parent-side selector state)
+            operator_id = None
+            template_key = None
+            if self.operator_selector is not None:
+                operator_id = self.operator_selector.select()
+                template_key = self.operator_pool.resolve(operator_id)
+                self._pending_operator[iteration] = operator_id
+
             # Submit to process pool
             future = self.executor.submit(
                 _run_iteration_worker,
@@ -818,6 +916,8 @@ class ProcessParallelController:
                 db_snapshot,
                 parent.id,
                 [insp.id for insp in inspirations],
+                operator_id,
+                template_key,
             )
 
             return future

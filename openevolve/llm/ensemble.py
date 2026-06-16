@@ -31,6 +31,9 @@ class LLMEnsemble:
         total = sum(self.weights)
         self.weights = [w / total for w in self.weights]
 
+        # Track the most recently sampled model so callers can read its token usage
+        self._last_sampled_model: Optional[LLMInterface] = None
+
         # Set up random state for deterministic model selection
         self.random_state = random.Random()
         # Initialize with seed from first model's config if available
@@ -71,8 +74,23 @@ class LLMEnsemble:
         """Sample a model from the ensemble based on weights"""
         index = self.random_state.choices(range(len(self.models)), weights=self.weights, k=1)[0]
         sampled_model = self.models[index]
+        self._last_sampled_model = sampled_model
         logger.info(f"Sampled model: {vars(sampled_model)['model']}")
         return sampled_model
+
+    def pop_last_usage(self) -> Optional[Dict[str, int]]:
+        """Return and clear token usage from the most recently sampled model's call.
+
+        Returns None when the provider omitted usage or no call has been made.
+        """
+        model = getattr(self, "_last_sampled_model", None)
+        if model is None:
+            return None
+        usage = getattr(model, "last_usage", None)
+        # Clear so a subsequent call without usage doesn't double-count.
+        if hasattr(model, "last_usage"):
+            model.last_usage = None
+        return usage
 
     async def generate_multiple(self, prompt: str, n: int, **kwargs) -> List[str]:
         """Generate multiple texts in parallel"""
