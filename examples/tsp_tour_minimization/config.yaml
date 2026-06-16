@@ -7,10 +7,10 @@ log_level: "INFO"
 
 # LLM configuration
 llm:
-  primary_model: "deepseek-reasoner"
+  primary_model: "deepseek-v4-pro"
   primary_model_weight: 1.0
   api_base: "https://api.deepseek.com"
-  api_key: "<your-api-key>"
+  api_key: "${DEEPSEEK_API}"  
   temperature: 0.5
   max_tokens: 64000
   timeout: 600

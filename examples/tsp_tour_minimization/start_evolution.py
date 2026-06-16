@@ -1,3 +1,4 @@
+import os
 import re
 import sys
 import pathlib
@@ -5,6 +6,29 @@ import asyncio
 
 BASE_DIR = pathlib.Path(__file__).parent
 sys.path.append(str(BASE_DIR))
+
+
+def load_dotenv(path: pathlib.Path) -> None:
+    """Load ``KEY=VALUE`` pairs from a .env file into ``os.environ``.
+
+    Minimal, dependency-free loader so config.yaml can reference secrets such as
+    ``api_key: "${DEEPSEEK_API}"`` instead of hard-coding them. Existing
+    environment variables take precedence and are never overwritten.
+    """
+    if not path.exists():
+        return
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv(BASE_DIR / ".env")
 
 # click & related imports
 import click

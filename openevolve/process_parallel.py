@@ -401,7 +401,6 @@ class ProcessParallelController:
         self.operator_pool: Optional[OperatorPool] = None
         self.operator_selector = None
         self.cost_meter: Optional[CostMeter] = None
-        self._pending_operator: Dict[int, str] = {}
         if op_config.enabled:
             self.operator_pool = OperatorPool(op_config.operator_ids)
             self.operator_selector = build_selector(
@@ -613,9 +612,9 @@ class ProcessParallelController:
                 result = future.result(timeout=timeout_seconds)
 
                 # Operator accounting (parent-side). Meter tokens for every completed
-                # call (success or discard — both were billed) and drop the pending entry.
+                # call (success or discard — both were billed). The chosen operator
+                # round-trips on the result itself, so no parent-side bookkeeping is needed.
                 operator_id = result.operator_id
-                self._pending_operator.pop(completed_iteration, None)
                 if operator_id is not None and self.cost_meter is not None:
                     self.cost_meter.add(operator_id, result.usage)
 
@@ -832,10 +831,8 @@ class ProcessParallelController:
                 )
                 # Cancel the future to clean up the process
                 future.cancel()
-                self._pending_operator.pop(completed_iteration, None)
             except Exception as e:
                 logger.error(f"Error processing result from iteration {completed_iteration}: {e}")
-                self._pending_operator.pop(completed_iteration, None)
 
             completed_iterations += 1
 
@@ -907,7 +904,6 @@ class ProcessParallelController:
             if self.operator_selector is not None:
                 operator_id = self.operator_selector.select()
                 template_key = self.operator_pool.resolve(operator_id)
-                self._pending_operator[iteration] = operator_id
 
             # Submit to process pool
             future = self.executor.submit(

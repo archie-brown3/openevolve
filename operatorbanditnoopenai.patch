@@ -1,0 +1,814 @@
+diff --git a/openevolve/config.py b/openevolve/config.py
+index bef193d..cc2264d 100644
+--- a/openevolve/config.py
++++ b/openevolve/config.py
+@@ -397,6 +397,20 @@ class EvolutionTraceConfig:
+     compress: bool = False
+ 
+ 
++@dataclass
++class OperatorConfig:
++    """Configuration for the operator-selection layer.
++
++    When ``enabled`` is False the controller applies no selection and behaviour
++    is identical to stock OpenEvolve (every iteration uses the default template).
++    """
++
++    enabled: bool = False
++    selector: str = "ucb"  # "random" | "ucb"
++    operator_ids: List[str] = field(default_factory=lambda: ["baseline", "reflect_rewrite"])
++    ucb_c: float = 1.414
++
++
+ @dataclass
+ class Config:
+     """Master configuration for OpenEvolve"""
+@@ -416,6 +430,7 @@ class Config:
+     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
+     evolution_trace: EvolutionTraceConfig = field(default_factory=EvolutionTraceConfig)
++    operators: OperatorConfig = field(default_factory=OperatorConfig)
+ 
+     # Evolution settings
+     diff_based_evolution: bool = True
+diff --git a/openevolve/llm/ensemble.py b/openevolve/llm/ensemble.py
+index e3c4716..d37694a 100644
+--- a/openevolve/llm/ensemble.py
++++ b/openevolve/llm/ensemble.py
+@@ -31,6 +31,9 @@ class LLMEnsemble:
+         total = sum(self.weights)
+         self.weights = [w / total for w in self.weights]
+ 
++        # Track the most recently sampled model so callers can read its token usage
++        self._last_sampled_model: Optional[LLMInterface] = None
++
+         # Set up random state for deterministic model selection
+         self.random_state = random.Random()
+         # Initialize with seed from first model's config if available
+@@ -71,9 +74,24 @@ class LLMEnsemble:
+         """Sample a model from the ensemble based on weights"""
+         index = self.random_state.choices(range(len(self.models)), weights=self.weights, k=1)[0]
+         sampled_model = self.models[index]
++        self._last_sampled_model = sampled_model
+         logger.info(f"Sampled model: {vars(sampled_model)['model']}")
+         return sampled_model
+ 
++    def pop_last_usage(self) -> Optional[Dict[str, int]]:
++        """Return and clear token usage from the most recently sampled model's call.
++
++        Returns None when the provider omitted usage or no call has been made.
++        """
++        model = getattr(self, "_last_sampled_model", None)
++        if model is None:
++            return None
++        usage = getattr(model, "last_usage", None)
++        # Clear so a subsequent call without usage doesn't double-count.
++        if hasattr(model, "last_usage"):
++            model.last_usage = None
++        return usage
++
+     async def generate_multiple(self, prompt: str, n: int, **kwargs) -> List[str]:
+         """Generate multiple texts in parallel"""
+         tasks = [self.generate(prompt, **kwargs) for _ in range(n)]
+diff --git a/openevolve/operators/__init__.py b/openevolve/operators/__init__.py
+new file mode 100644
+index 0000000..3428365
+--- /dev/null
++++ b/openevolve/operators/__init__.py
+@@ -0,0 +1,32 @@
++"""
++Operator-selection layer for OpenEvolve.
++
++An *operator* is a named prompt strategy resolved to a user-message template. A
++*selector* chooses which operator to apply each iteration and receives a reward
++(fitness gain) afterwards, so it can adapt over time. State lives on the parent
++controller process; workers only receive the resolved ``template_key``.
++"""
++
++from openevolve.operators.bandit import UCBSelector
++from openevolve.operators.cost_meter import CostMeter
++from openevolve.operators.pool import OperatorPool
++from openevolve.operators.selector import OperatorSelector, RandomSelector
++
++__all__ = [
++    "OperatorPool",
++    "OperatorSelector",
++    "RandomSelector",
++    "UCBSelector",
++    "CostMeter",
++    "build_selector",
++]
++
++
++def build_selector(name: str, operator_ids, ucb_c: float = 1.414, seed=None) -> OperatorSelector:
++    """Construct a selector by config name (``"random"`` or ``"ucb"``)."""
++    name = (name or "ucb").lower()
++    if name == "random":
++        return RandomSelector(operator_ids, seed=seed)
++    if name == "ucb":
++        return UCBSelector(operator_ids, c=ucb_c, seed=seed)
++    raise ValueError(f"Unknown operator selector: {name!r} (expected 'random' or 'ucb')")
+diff --git a/openevolve/operators/bandit.py b/openevolve/operators/bandit.py
+new file mode 100644
+index 0000000..2b68888
+--- /dev/null
++++ b/openevolve/operators/bandit.py
+@@ -0,0 +1,60 @@
++"""
++UCB1 bandit operator selector (numerical AOS, Condition 3).
++
++Each operator is an arm. ``select`` plays every arm once, then maximises the
++UCB1 index ``mean_i + c * sqrt(2 * ln t / N_i)``. ``update`` keeps an
++incremental sample mean of the reward (fitness gain). All state lives on the
++parent controller process, so no locking is required.
++"""
++
++import math
++import random
++from typing import Dict, List, Optional
++
++from openevolve.operators.selector import OperatorSelector
++
++
++class UCBSelector(OperatorSelector):
++    """UCB1 over a fixed set of operator arms."""
++
++    def __init__(self, operator_ids: List[str], c: float = 1.414, seed: Optional[int] = None):
++        if not operator_ids:
++            raise ValueError("UCBSelector requires at least one operator id")
++        self._ids = list(operator_ids)
++        self.c = c
++        self._rng = random.Random(seed)
++        self._counts: Dict[str, int] = {oid: 0 for oid in self._ids}
++        self._means: Dict[str, float] = {oid: 0.0 for oid in self._ids}
++        self._t = 0  # total number of updates observed
++
++    def select(self) -> str:
++        # Play each arm at least once before applying the UCB index.
++        unplayed = [oid for oid in self._ids if self._counts[oid] == 0]
++        if unplayed:
++            return self._rng.choice(unplayed)
++
++        t = max(self._t, 1)
++        best_id = None
++        best_index = -math.inf
++        for oid in self._ids:
++            bonus = self.c * math.sqrt(2.0 * math.log(t) / self._counts[oid])
++            index = self._means[oid] + bonus
++            if index > best_index:
++                best_index = index
++                best_id = oid
++        return best_id
++
++    def update(self, operator_id: str, reward: float) -> None:
++        if operator_id not in self._counts:
++            raise KeyError(f"Operator id not in selector: {operator_id!r}")
++        self._t += 1
++        self._counts[operator_id] += 1
++        n = self._counts[operator_id]
++        # Incremental sample mean.
++        self._means[operator_id] += (reward - self._means[operator_id]) / n
++
++    def stats(self) -> Dict[str, Dict[str, float]]:
++        """Per-arm pull counts and mean rewards (for logging/analysis)."""
++        return {
++            oid: {"count": self._counts[oid], "mean_reward": self._means[oid]} for oid in self._ids
++        }
+diff --git a/openevolve/operators/cost_meter.py b/openevolve/operators/cost_meter.py
+new file mode 100644
+index 0000000..6afb137
+--- /dev/null
++++ b/openevolve/operators/cost_meter.py
+@@ -0,0 +1,42 @@
++"""
++Minimal per-operator token accounting.
++
++Honest cost accounting for the experiment: every metered LLM call's token usage
++is attributed to the operator that produced it. Lives on the parent controller.
++"""
++
++from typing import Dict, Optional
++
++
++class CostMeter:
++    """Accumulates prompt/completion tokens and call counts per operator."""
++
++    def __init__(self):
++        self._by_operator: Dict[str, Dict[str, int]] = {}
++
++    def add(self, operator_id: Optional[str], usage: Optional[Dict[str, int]]) -> None:
++        """Attribute a single call's token usage to ``operator_id``.
++
++        ``usage`` is ``None`` when the provider omits it (e.g. some OpenAI-compatible
++        servers), in which case the call count is still recorded.
++        """
++        key = operator_id if operator_id is not None else "unknown"
++        bucket = self._by_operator.setdefault(
++            key, {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
++        )
++        bucket["calls"] += 1
++        if usage:
++            bucket["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
++            bucket["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
++
++    def totals(self) -> Dict[str, Dict[str, int]]:
++        """Return a copy of the per-operator token totals."""
++        return {k: dict(v) for k, v in self._by_operator.items()}
++
++    def grand_total(self) -> Dict[str, int]:
++        """Aggregate token totals across all operators."""
++        total = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
++        for bucket in self._by_operator.values():
++            for k in total:
++                total[k] += bucket[k]
++        return total
+diff --git a/openevolve/operators/pool.py b/openevolve/operators/pool.py
+new file mode 100644
+index 0000000..4ecc5ea
+--- /dev/null
++++ b/openevolve/operators/pool.py
+@@ -0,0 +1,46 @@
++"""
++Operator pool: maps operator ids to prompt template keys.
++
++An operator id of ``"baseline"`` resolves to ``None``, meaning the worker falls
++through to OpenEvolve's default ``diff_user``/``full_rewrite_user`` behaviour
++(driven by ``config.diff_based_evolution``). Any other operator resolves to a
++named template loaded by :class:`~openevolve.prompt.templates.TemplateManager`.
++"""
++
++from typing import Dict, List, Optional
++
++# Built-in operators available in this experiment slice.
++# operator_id -> template_key (None means "use OpenEvolve's default template")
++DEFAULT_OPERATORS: Dict[str, Optional[str]] = {
++    "baseline": None,
++    "reflect_rewrite": "op_reflect_rewrite",
++}
++
++
++class OperatorPool:
++    """Registry mapping operator ids to prompt template keys."""
++
++    def __init__(self, operator_ids: Optional[List[str]] = None):
++        if operator_ids is None:
++            self._mapping = dict(DEFAULT_OPERATORS)
++        else:
++            unknown = [oid for oid in operator_ids if oid not in DEFAULT_OPERATORS]
++            if unknown:
++                raise ValueError(
++                    f"Unknown operator id(s): {unknown}. "
++                    f"Known operators: {sorted(DEFAULT_OPERATORS)}"
++                )
++            self._mapping = {oid: DEFAULT_OPERATORS[oid] for oid in operator_ids}
++
++        if not self._mapping:
++            raise ValueError("OperatorPool requires at least one operator")
++
++    def ids(self) -> List[str]:
++        """Operator ids in registration order."""
++        return list(self._mapping.keys())
++
++    def resolve(self, operator_id: str) -> Optional[str]:
++        """Return the template key for an operator id (``None`` for the default)."""
++        if operator_id not in self._mapping:
++            raise KeyError(f"Operator id not in pool: {operator_id!r}")
++        return self._mapping[operator_id]
+diff --git a/openevolve/operators/selector.py b/openevolve/operators/selector.py
+new file mode 100644
+index 0000000..6bfb65e
+--- /dev/null
++++ b/openevolve/operators/selector.py
+@@ -0,0 +1,36 @@
++"""
++Operator selector interface and a uniform-random baseline.
++"""
++
++import random
++from abc import ABC, abstractmethod
++from typing import List, Optional
++
++
++class OperatorSelector(ABC):
++    """Chooses an operator per iteration and learns from the resulting reward."""
++
++    @abstractmethod
++    def select(self) -> str:
++        """Return the operator id to apply this iteration."""
++
++    @abstractmethod
++    def update(self, operator_id: str, reward: float) -> None:
++        """Record the reward (fitness gain) obtained from ``operator_id``."""
++
++
++class RandomSelector(OperatorSelector):
++    """Uniform-random choice over the pool. Control condition; ignores reward."""
++
++    def __init__(self, operator_ids: List[str], seed: Optional[int] = None):
++        if not operator_ids:
++            raise ValueError("RandomSelector requires at least one operator id")
++        self._ids = list(operator_ids)
++        self._rng = random.Random(seed)
++
++    def select(self) -> str:
++        return self._rng.choice(self._ids)
++
++    def update(self, operator_id: str, reward: float) -> None:
++        # Random scheduling does not adapt.
++        return None
+diff --git a/openevolve/process_parallel.py b/openevolve/process_parallel.py
+index a2fd659..ffb98a4 100644
+--- a/openevolve/process_parallel.py
++++ b/openevolve/process_parallel.py
+@@ -16,7 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
+ 
+ from openevolve.config import Config
+ from openevolve.database import Program, ProgramDatabase
+-from openevolve.utils.metrics_utils import safe_numeric_average
++from openevolve.operators import CostMeter, OperatorPool, build_selector
++from openevolve.utils.metrics_utils import get_fitness_score, safe_numeric_average
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -34,6 +35,8 @@ class SerializableResult:
+     iteration: int = 0
+     error: Optional[str] = None
+     target_island: Optional[int] = None  # Island where child should be placed
++    operator_id: Optional[str] = None  # Operator chosen by the selector for this iteration
++    usage: Optional[Dict[str, int]] = None  # Token usage from the worker's LLM call
+ 
+ 
+ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
+@@ -132,7 +135,12 @@ def _lazy_init_worker_components():
+ 
+ 
+ def _run_iteration_worker(
+-    iteration: int, db_snapshot: Dict[str, Any], parent_id: str, inspiration_ids: List[str]
++    iteration: int,
++    db_snapshot: Dict[str, Any],
++    parent_id: str,
++    inspiration_ids: List[str],
++    operator_id: Optional[str] = None,
++    template_key: Optional[str] = None,
+ ) -> SerializableResult:
+     """Run a single iteration in a worker process"""
+     try:
+@@ -191,6 +199,7 @@ def _run_iteration_worker(
+             program_artifacts=parent_artifacts,
+             feature_dimensions=db_snapshot.get("feature_dimensions", []),
+             current_changes_description=parent_changes_desc,
++            template_key=template_key,
+         )
+ 
+         iteration_start = time.time()
+@@ -205,11 +214,23 @@ def _run_iteration_worker(
+             )
+         except Exception as e:
+             logger.error(f"LLM generation failed: {e}")
+-            return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
++            return SerializableResult(
++                error=f"LLM generation failed: {str(e)}",
++                iteration=iteration,
++                operator_id=operator_id,
++            )
++
++        # Capture token usage from the call just made (None if provider omits it)
++        call_usage = _worker_llm_ensemble.pop_last_usage()
+ 
+         # Check for None response
+         if llm_response is None:
+-            return SerializableResult(error="LLM returned None response", iteration=iteration)
++            return SerializableResult(
++                error="LLM returned None response",
++                iteration=iteration,
++                operator_id=operator_id,
++                usage=call_usage,
++            )
+ 
+         # Parse response based on evolution mode
+         if _worker_config.diff_based_evolution:
+@@ -224,7 +245,10 @@ def _run_iteration_worker(
+             diff_blocks = extract_diffs(llm_response, _worker_config.diff_pattern)
+             if not diff_blocks:
+                 return SerializableResult(
+-                    error="No valid diffs found in response", iteration=iteration
++                    error="No valid diffs found in response",
++                    iteration=iteration,
++                    operator_id=operator_id,
++                    usage=call_usage,
+                 )
+ 
+             if _worker_config.prompt.programs_as_changes_description:
+@@ -235,7 +259,12 @@ def _run_iteration_worker(
+                         changes_description_text=parent_changes_desc,
+                     )
+                 except Exception as e:
+-                    return SerializableResult(error=str(e), iteration=iteration)
++                    return SerializableResult(
++                        error=str(e),
++                        iteration=iteration,
++                        operator_id=operator_id,
++                        usage=call_usage,
++                    )
+ 
+                 child_code, _ = apply_diff_blocks(parent.code, code_blocks)
+                 child_changes_desc, desc_applied = apply_diff_blocks(
+@@ -251,6 +280,8 @@ def _run_iteration_worker(
+                     return SerializableResult(
+                         error="changes_description was not updated or empty, program is discarded",
+                         iteration=iteration,
++                        operator_id=operator_id,
++                        usage=call_usage,
+                     )
+ 
+                 changes_summary = format_diff_summary(
+@@ -272,7 +303,10 @@ def _run_iteration_worker(
+             new_code = parse_full_rewrite(llm_response, _worker_config.language)
+             if not new_code:
+                 return SerializableResult(
+-                    error=f"No valid code found in response", iteration=iteration
++                    error=f"No valid code found in response",
++                    iteration=iteration,
++                    operator_id=operator_id,
++                    usage=call_usage,
+                 )
+ 
+             child_code = new_code
+@@ -283,6 +317,8 @@ def _run_iteration_worker(
+             return SerializableResult(
+                 error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})",
+                 iteration=iteration,
++                operator_id=operator_id,
++                usage=call_usage,
+             )
+ 
+         # Evaluate the child program
+@@ -325,6 +361,8 @@ def _run_iteration_worker(
+             artifacts=artifacts,
+             iteration=iteration,
+             target_island=target_island,
++            operator_id=operator_id,
++            usage=call_usage,
+         )
+ 
+     except Exception as e:
+@@ -357,6 +395,27 @@ class ProcessParallelController:
+         self.num_workers = config.evaluator.parallel_evaluations
+         self.num_islands = config.database.num_islands
+ 
++        # Operator-selection layer (parent-process state). When disabled, no operator
++        # is chosen and workers fall through to the default template (template_key=None).
++        op_config = config.operators
++        self.operator_pool: Optional[OperatorPool] = None
++        self.operator_selector = None
++        self.cost_meter: Optional[CostMeter] = None
++        self._pending_operator: Dict[int, str] = {}
++        if op_config.enabled:
++            self.operator_pool = OperatorPool(op_config.operator_ids)
++            self.operator_selector = build_selector(
++                op_config.selector,
++                self.operator_pool.ids(),
++                ucb_c=op_config.ucb_c,
++                seed=config.random_seed,
++            )
++            self.cost_meter = CostMeter()
++            logger.info(
++                f"Operator selection enabled: selector={op_config.selector}, "
++                f"operators={self.operator_pool.ids()}"
++            )
++
+         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
+ 
+     def _serialize_config(self, config: Config) -> dict:
+@@ -553,8 +612,19 @@ class ProcessParallelController:
+                 timeout_seconds = self.config.evaluator.timeout + 30
+                 result = future.result(timeout=timeout_seconds)
+ 
++                # Operator accounting (parent-side). Meter tokens for every completed
++                # call (success or discard — both were billed) and drop the pending entry.
++                operator_id = result.operator_id
++                self._pending_operator.pop(completed_iteration, None)
++                if operator_id is not None and self.cost_meter is not None:
++                    self.cost_meter.add(operator_id, result.usage)
++
+                 if result.error:
+                     logger.warning(f"Iteration {completed_iteration} error: {result.error}")
++                    # A discarded attempt still consumed a call: credit the operator with
++                    # zero reward so the bandit does not over-favour failure-prone operators.
++                    if operator_id is not None and self.operator_selector is not None:
++                        self.operator_selector.update(operator_id, 0.0)
+                 elif result.child_program_dict:
+                     # Reconstruct program from dict
+                     child_program = Program(**result.child_program_dict)
+@@ -568,6 +638,16 @@ class ProcessParallelController:
+                         target_island=result.target_island,
+                     )
+ 
++                    # Credit the operator with the fitness gain over its parent.
++                    if operator_id is not None and self.operator_selector is not None:
++                        feature_dims = self.database.config.feature_dimensions
++                        child_fit = get_fitness_score(child_program.metrics, feature_dims)
++                        parent_fit = get_fitness_score(
++                            child_program.metadata.get("parent_metrics", {}), feature_dims
++                        )
++                        self.operator_selector.update(operator_id, child_fit - parent_fit)
++                        child_program.metadata["operator_id"] = operator_id
++
+                     # Store artifacts
+                     if result.artifacts:
+                         self.database.store_artifacts(child_program.id, result.artifacts)
+@@ -752,8 +832,10 @@ class ProcessParallelController:
+                 )
+                 # Cancel the future to clean up the process
+                 future.cancel()
++                self._pending_operator.pop(completed_iteration, None)
+             except Exception as e:
+                 logger.error(f"Error processing result from iteration {completed_iteration}: {e}")
++                self._pending_operator.pop(completed_iteration, None)
+ 
+             completed_iterations += 1
+ 
+@@ -791,6 +873,14 @@ class ProcessParallelController:
+         else:
+             logger.info("✅ Evolution completed - Maximum iterations reached")
+ 
++        # Operator-selection summary for analysis
++        if self.operator_selector is not None:
++            stats = getattr(self.operator_selector, "stats", None)
++            if callable(stats):
++                logger.info(f"Operator selector stats: {stats()}")
++        if self.cost_meter is not None:
++            logger.info(f"Operator token totals: {self.cost_meter.totals()}")
++
+         return self.database.get_best_program()
+ 
+     def _submit_iteration(
+@@ -811,6 +901,14 @@ class ProcessParallelController:
+             db_snapshot = self._create_database_snapshot()
+             db_snapshot["sampling_island"] = target_island  # Mark which island this is for
+ 
++            # Choose the operator for this iteration (parent-side selector state)
++            operator_id = None
++            template_key = None
++            if self.operator_selector is not None:
++                operator_id = self.operator_selector.select()
++                template_key = self.operator_pool.resolve(operator_id)
++                self._pending_operator[iteration] = operator_id
++
+             # Submit to process pool
+             future = self.executor.submit(
+                 _run_iteration_worker,
+@@ -818,6 +916,8 @@ class ProcessParallelController:
+                 db_snapshot,
+                 parent.id,
+                 [insp.id for insp in inspirations],
++                operator_id,
++                template_key,
+             )
+ 
+             return future
+diff --git a/openevolve/prompts/defaults/op_reflect_rewrite.txt b/openevolve/prompts/defaults/op_reflect_rewrite.txt
+new file mode 100644
+index 0000000..0ac5da3
+--- /dev/null
++++ b/openevolve/prompts/defaults/op_reflect_rewrite.txt
+@@ -0,0 +1,51 @@
++# Current Program Information
++- Fitness: {fitness_score}
++- Feature coordinates: {feature_coords}
++- Focus areas: {improvement_areas}
++
++{artifacts}
++
++# Program Evolution History
++{evolution_history}
++
++# Current Program
++```{language}
++{current_program}
++```
++
++# Task
++First, reflect: in two or three sentences, diagnose the single biggest weakness
++holding back the current program's FITNESS SCORE — be concrete about which part
++of the code or which design choice is limiting it.
++
++Then, acting on that diagnosis, propose targeted improvements that raise the
++FITNESS SCORE. The system maintains diversity across these dimensions:
++{feature_dimensions}. Solutions with similar fitness but different features are
++valuable, so prefer a change that meaningfully alters behaviour over a cosmetic one.
++
++You MUST use the exact SEARCH/REPLACE diff format shown below to indicate changes:
++
++<<<<<<< SEARCH
++# Original code to find and replace (must match exactly)
++=======
++# New replacement code
++>>>>>>> REPLACE
++
++Example of valid diff format:
++<<<<<<< SEARCH
++for i in range(m):
++    for j in range(p):
++        for k in range(n):
++            C[i, j] += A[i, k] * B[k, j]
++=======
++# Reorder loops for better memory access pattern
++for i in range(m):
++    for k in range(n):
++        for j in range(p):
++            C[i, j] += A[i, k] * B[k, j]
++>>>>>>> REPLACE
++
++You can suggest multiple changes. Each SEARCH section must exactly match code in the current program.
++Begin with your short reflection, then provide the diffs. Explain your reasoning thoroughly.
++
++IMPORTANT: Do not rewrite the entire program - focus on targeted improvements that follow from your diagnosis.
+diff --git a/tests/test_operators.py b/tests/test_operators.py
+new file mode 100644
+index 0000000..34ec0e3
+--- /dev/null
++++ b/tests/test_operators.py
+@@ -0,0 +1,182 @@
++"""
++Tests for the operator-selection layer (openevolve.operators) and its wiring.
++"""
++
++import random
++import unittest
++
++from openevolve.config import Config, OperatorConfig
++from openevolve.operators import (
++    CostMeter,
++    OperatorPool,
++    RandomSelector,
++    UCBSelector,
++    build_selector,
++)
++from openevolve.operators.pool import DEFAULT_OPERATORS
++from openevolve.prompt.templates import TemplateManager
++from openevolve.utils.metrics_utils import get_fitness_score
++
++
++class TestOperatorPool(unittest.TestCase):
++    def test_default_pool_resolution(self):
++        pool = OperatorPool()
++        self.assertEqual(pool.ids(), ["baseline", "reflect_rewrite"])
++        # Baseline resolves to None -> worker uses OpenEvolve's default template.
++        self.assertIsNone(pool.resolve("baseline"))
++        self.assertEqual(pool.resolve("reflect_rewrite"), "op_reflect_rewrite")
++
++    def test_subset_and_order_preserved(self):
++        pool = OperatorPool(["reflect_rewrite", "baseline"])
++        self.assertEqual(pool.ids(), ["reflect_rewrite", "baseline"])
++
++    def test_unknown_operator_rejected(self):
++        with self.assertRaises(ValueError):
++            OperatorPool(["nope"])
++        with self.assertRaises(KeyError):
++            OperatorPool().resolve("nope")
++
++    def test_empty_pool_rejected(self):
++        with self.assertRaises(ValueError):
++            OperatorPool([])
++
++
++class TestRandomSelector(unittest.TestCase):
++    def test_returns_only_pool_ids_and_is_uniform(self):
++        ids = ["a", "b", "c"]
++        sel = RandomSelector(ids, seed=123)
++        counts = {i: 0 for i in ids}
++        for _ in range(3000):
++            choice = sel.select()
++            self.assertIn(choice, ids)
++            counts[choice] += 1
++        # Roughly uniform: each arm within a generous band around 1000.
++        for i in ids:
++            self.assertGreater(counts[i], 800)
++            self.assertLess(counts[i], 1200)
++
++    def test_update_is_noop(self):
++        sel = RandomSelector(["a", "b"], seed=1)
++        sel.update("a", 5.0)  # must not raise or change behaviour
++
++
++class TestUCBSelector(unittest.TestCase):
++    def test_plays_each_arm_before_repeating(self):
++        sel = UCBSelector(["a", "b", "c"], seed=7)
++        first_three = set()
++        for _ in range(3):
++            choice = sel.select()
++            first_three.add(choice)
++            sel.update(choice, 0.0)
++        self.assertEqual(first_three, {"a", "b", "c"})
++
++    def test_converges_to_better_arm(self):
++        rng = random.Random(42)
++        sel = UCBSelector(["good", "bad"], c=1.0, seed=42)
++        picks = []
++        for _ in range(2000):
++            arm = sel.select()
++            # Stationary rewards: good arm centred at 1.0, bad arm at 0.0.
++            reward = rng.gauss(1.0, 0.1) if arm == "good" else rng.gauss(0.0, 0.1)
++            sel.update(arm, reward)
++            picks.append(arm)
++        # The bandit should overwhelmingly prefer the better arm by the end.
++        tail = picks[-500:]
++        self.assertGreater(tail.count("good"), 480)
++        self.assertGreater(sel.stats()["good"]["mean_reward"], sel.stats()["bad"]["mean_reward"])
++
++    def test_unknown_arm_update_raises(self):
++        sel = UCBSelector(["a", "b"])
++        with self.assertRaises(KeyError):
++            sel.update("c", 1.0)
++
++
++class TestBuildSelector(unittest.TestCase):
++    def test_build_by_name(self):
++        self.assertIsInstance(build_selector("random", ["a", "b"]), RandomSelector)
++        self.assertIsInstance(build_selector("ucb", ["a", "b"]), UCBSelector)
++        with self.assertRaises(ValueError):
++            build_selector("bogus", ["a", "b"])
++
++
++class TestCostMeter(unittest.TestCase):
++    def test_accumulates_per_operator(self):
++        meter = CostMeter()
++        meter.add("baseline", {"prompt_tokens": 10, "completion_tokens": 5})
++        meter.add("baseline", {"prompt_tokens": 3, "completion_tokens": 2})
++        meter.add("reflect_rewrite", {"prompt_tokens": 7, "completion_tokens": 1})
++        totals = meter.totals()
++        self.assertEqual(
++            totals["baseline"], {"prompt_tokens": 13, "completion_tokens": 7, "calls": 2}
++        )
++        self.assertEqual(totals["reflect_rewrite"]["calls"], 1)
++        grand = meter.grand_total()
++        self.assertEqual(grand["prompt_tokens"], 20)
++        self.assertEqual(grand["completion_tokens"], 8)
++        self.assertEqual(grand["calls"], 3)
++
++    def test_missing_usage_counts_call_only(self):
++        meter = CostMeter()
++        meter.add("baseline", None)
++        totals = meter.totals()
++        self.assertEqual(
++            totals["baseline"], {"prompt_tokens": 0, "completion_tokens": 0, "calls": 1}
++        )
++
++    def test_none_operator_bucketed_as_unknown(self):
++        meter = CostMeter()
++        meter.add(None, {"prompt_tokens": 4, "completion_tokens": 0})
++        self.assertIn("unknown", meter.totals())
++
++
++class TestOperatorTemplate(unittest.TestCase):
++    def test_template_loaded_and_valid(self):
++        tm = TemplateManager()
++        self.assertIn("op_reflect_rewrite", tm.templates)
++        text = tm.templates["op_reflect_rewrite"]
++        self.assertTrue(text.strip())
++        # Keeps OpenEvolve's diff output contract and core placeholder.
++        self.assertIn("<<<<<<< SEARCH", text)
++        self.assertIn(">>>>>>> REPLACE", text)
++        self.assertIn("{current_program}", text)
++
++
++class TestRewardMath(unittest.TestCase):
++    def test_fitness_gain_uses_combined_score(self):
++        # Mirrors the reward computed in the result loop: fit(child) - fit(parent).
++        parent_metrics = {"combined_score": 0.4}
++        child_metrics = {"combined_score": 0.7}
++        feature_dims = []
++        captured = {}
++
++        class _Recorder(UCBSelector):
++            def update(self, operator_id, reward):
++                captured["reward"] = reward
++                super().update(operator_id, reward)
++
++        sel = _Recorder(["baseline"], seed=0)
++        sel.select()
++        reward = get_fitness_score(child_metrics, feature_dims) - get_fitness_score(
++            parent_metrics, feature_dims
++        )
++        sel.update("baseline", reward)
++        self.assertAlmostEqual(captured["reward"], 0.3)
++
++
++class TestOperatorConfig(unittest.TestCase):
++    def test_defaults_disabled(self):
++        cfg = Config()
++        self.assertIsInstance(cfg.operators, OperatorConfig)
++        self.assertFalse(cfg.operators.enabled)
++        self.assertEqual(cfg.operators.operator_ids, list(DEFAULT_OPERATORS.keys()))
++
++    def test_from_dict_parses_operators(self):
++        cfg = Config.from_dict(
++            {"operators": {"enabled": True, "selector": "ucb", "operator_ids": ["baseline"]}}
++        )
++        self.assertTrue(cfg.operators.enabled)
++        self.assertEqual(cfg.operators.operator_ids, ["baseline"])
++
++
++if __name__ == "__main__":
++    unittest.main()

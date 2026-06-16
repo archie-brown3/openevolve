@@ -1,0 +1,61 @@
+# Experiment config: Qwen2.5-Coder-7B-Instruct-4bit via MLX server
+#
+# Tuned for a 7B 4-bit model on 8GB M2:
+#   - timeout: 600 — 7B needs ~2-3 min per generation at ~20 tok/s
+#   - parallel_evaluations: 1 — mlx_lm.server is single-threaded; two simultaneous
+#     requests cause the second to wait and then hit the timeout
+#   - max_tokens: 4096 — enough for a full rewrite (~200s at 20 tok/s, well within timeout
+#   - Full rewrites — more natural output for an instruction-tuned model
+
+max_iterations: 30
+checkpoint_interval: 5
+log_level: "INFO"
+
+llm:
+  # Model name is overridden at runtime by run_experiment.sh via --primary-model
+  # using the name reported by GET /v1/models from the llama.cpp server.
+  primary_model: "qwen2.5-0.5b"
+  primary_model_weight: 1.0
+  api_base: "http://localhost:8080/v1"
+  api_key: "local"
+  temperature: 0.8
+  max_tokens: 4096
+  timeout: 600
+  retries: 2
+  retry_delay: 3
+
+prompt:
+  system_message: |
+    You are a Python programmer improving a circle packing function. Your task is to modify a function that places 26 non-overlapping circles inside a unit square [0,1]x[0,1], maximizing the sum of their radii.
+
+    Rules:
+    - All circles must stay within the unit square (center_x - radius >= 0, center_x + radius <= 1, same for y)
+    - No two circles may overlap (distance between centers >= sum of radii)
+    - Return exactly 26 circles
+
+    Output the complete modified construct_packing() function only.
+  num_top_programs: 2
+  use_template_stochasticity: false
+
+database:
+  population_size: 40
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.3
+  exploitation_ratio: 0.7
+
+evaluator:
+  timeout: 60
+  cascade_evaluation: true
+  cascade_thresholds: [0.5, 0.75]
+  parallel_evaluations: 1
+  use_llm_feedback: false
+
+# Full rewrites — simpler for small models than structured diff blocks
+diff_based_evolution: false
+
+evolution_trace:
+  enabled: true
+  format: "jsonl"
+  include_code: true
+  include_prompts: true

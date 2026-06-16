@@ -151,13 +151,19 @@ class OpenAILLM(LLMInterface):
                 params["verbosity"] = kwargs["verbosity"]
         else:
             # Standard parameters for all other models
+            # Only include optional numeric params when they have a value — servers like mlx-lm
+            # reject null values for fields that expect a number (e.g. top_p, temperature).
             params = {
                 "model": self.model,
                 "messages": formatted_messages,
-                "temperature": kwargs.get("temperature", self.temperature),
-                "top_p": kwargs.get("top_p", self.top_p),
                 "max_tokens": kwargs.get("max_tokens", self.max_tokens),
             }
+            temperature = kwargs.get("temperature", self.temperature)
+            if temperature is not None:
+                params["temperature"] = temperature
+            top_p = kwargs.get("top_p", self.top_p)
+            if top_p is not None:
+                params["top_p"] = top_p
 
             # Handle reasoning_effort for open source reasoning models.
             reasoning_effort = kwargs.get("reasoning_effort", self.reasoning_effort)
