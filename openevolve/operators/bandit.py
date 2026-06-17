@@ -17,11 +17,16 @@ from openevolve.operators.selector import OperatorSelector
 class UCBSelector(OperatorSelector):
     """UCB1 over a fixed set of operator arms."""
 
-    def __init__(self, operator_ids: List[str], c: float = 1.414, seed: Optional[int] = None):
+    # Magic numbers extracted as class constants
+    DEFAULT_C = 1.414  # Approximately sqrt(2)
+    UCB1_LOG_FACTOR = 2.0  # Factor in UCB1 formula: c * sqrt(2 * ln(t) / N_i)
+    MIN_T = 1  # Minimum value for t to avoid log(0)
+
+    def __init__(self, operator_ids: List[str], c: float = None, seed: Optional[int] = None):
         if not operator_ids:
             raise ValueError("UCBSelector requires at least one operator id")
         self._ids = list(operator_ids)
-        self.c = c
+        self.c = c if c is not None else self.DEFAULT_C
         self._rng = random.Random(seed)
         self._counts: Dict[str, int] = {oid: 0 for oid in self._ids}
         self._means: Dict[str, float] = {oid: 0.0 for oid in self._ids}
@@ -33,11 +38,11 @@ class UCBSelector(OperatorSelector):
         if unplayed:
             return self._rng.choice(unplayed)
 
-        t = max(self._t, 1)
+        t = max(self._t, self.MIN_T)
         best_id = None
         best_index = -math.inf
         for oid in self._ids:
-            bonus = self.c * math.sqrt(2.0 * math.log(t) / self._counts[oid])
+            bonus = self.c * math.sqrt(self.UCB1_LOG_FACTOR * math.log(t) / self._counts[oid])
             index = self._means[oid] + bonus
             if index > best_index:
                 best_index = index

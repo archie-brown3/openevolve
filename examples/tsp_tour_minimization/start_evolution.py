@@ -28,7 +28,8 @@ def load_dotenv(path: pathlib.Path) -> None:
             os.environ[key] = value
 
 
-load_dotenv(BASE_DIR / ".env")
+load_dotenv(BASE_DIR / ".env")           # tsp dir
+load_dotenv(BASE_DIR.parent.parent / ".env")  # project root
 
 # click & related imports
 import click
