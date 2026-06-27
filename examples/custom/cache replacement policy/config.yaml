@@ -1,12 +1,12 @@
 # Cache replacement policy evolution — local llama.cpp (Qwen3.5-9B, thinking disabled)
 
-max_iterations: 50
+max_iterations: 500000
 checkpoint_interval: 10
 log_level: "INFO"
 random_seed: 42
 
 diff_based_evolution: false
-max_code_length: 5000
+max_code_length: 8000
 
 llm:
   models:
