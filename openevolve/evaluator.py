@@ -564,6 +564,7 @@ class Evaluator:
         try:
             # Create prompt for LLM
             feature_dimensions = self.database.config.feature_dimensions if self.database else []
+            # todo: consider passing additional context to the prompt, such as previous evaluations or program history across a vector database, including past reflections
             prompt = self.prompt_sampler.build_prompt(
                 current_program=program_code,
                 template_key="evaluation",
