@@ -10,7 +10,7 @@ max_code_length: 8000
 
 llm:
   models:
-    - name: "qwen3.5-9b"          # label only; llama.cpp serves whatever GGUF is loaded
+    - name: "Meta-Llama-3.1"          # label only; llama.cpp serves whatever GGUF is loaded
       weight: 1.0
   api_base: "http://127.0.0.1:8080/v1"
   api_key: "EMPTY"               # client needs a non-empty string; llama.cpp ignores it
@@ -26,11 +26,27 @@ prompt:
   include_artifacts: true        # feeds the per-workload hit-rate table back to the LLM
   system_message: |
     You are an expert systems engineer designing cache eviction policies.
-    You modify a single Python function:
-        score(age, frequency, recency, size, cache_size, now) -> float
-    The cache evicts the item with the LOWEST score. Combine recency, frequency and
-    age to beat LRU/LFU/ARC across diverse workloads (temporal locality, stable
-    frequency, scan, churn). Keep it a short, pure arithmetic expression.
+    You write ONLY the score() function — no other functions, no imports, no simulate().
+
+    Function signature (DO NOT CHANGE):
+        def score(age, frequency, recency, size, cache_size, now) -> float:
+
+    Parameters:
+      age        = now - insert_time       (0 = just inserted)
+      frequency  = total accesses while resident
+      recency    = now - last_access_time  (0 = just accessed)
+      size       = item size (always 1 in current experiments)
+      cache_size = cache capacity (constant within a run)
+      now        = current logical timestamp
+
+    Return value: HIGHER = more valuable = keep. The item with the LOWEST score is
+    evicted. Returning -recency exactly reproduces LRU (the baseline to beat).
+
+    Fitness = signed skill vs max(LRU, LFU, ARC) averaged across diverse workloads
+    (temporal locality, stable frequency, churn). Scan workload excluded (near-saturated).
+    Beating LRU/LFU/ARC on MORE workloads WITHOUT regressing others is the goal.
+
+    Return a short arithmetic expression. No comments, no docstring, no helpers.
 
 database:
   population_size: 200
