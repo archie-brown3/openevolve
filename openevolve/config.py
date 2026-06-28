@@ -109,8 +109,9 @@ class LLMConfig(LLMModelConfig):
     # n-model configuration for evolution LLM ensemble
     models: List[LLMModelConfig] = field(default_factory=list)
 
-    # n-model configuration for evaluator LLM ensemble
+    # n-model configuration for evaluator and reflexion LLM ensemble 
     evaluator_models: List[LLMModelConfig] = field(default_factory=lambda: [])
+    reflexion_models: List[LLMModelConfig] = field(default_factory=lambda: [])
 
     # Backwardes compatibility with primary_model(_weight) options
     primary_model: str = None
@@ -354,6 +355,18 @@ class DatabaseConfig:
 
 
 @dataclass
+class ReflexionConfig:
+    """Configuration for the Reflexion layer (stagnation-triggered prompt adaptation)"""
+    enabled: bool = False
+    stagnation_patience: int = 10  # island iterations w/o improvement before reflecting
+    memory_size: int = 3  # recent reflections shown to the model (paper: 1-3)
+    improvement_metric: str = "combined_score"
+    # Optional embedding-based dedup of reflections; None ⇒ plain bounded list
+    embedding_model: Optional[str] = None
+    similarity_threshold: float = 0.95
+
+
+@dataclass
 class EvaluatorConfig:
     """Configuration for program evaluation"""
 
@@ -416,6 +429,7 @@ class Config:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
     evolution_trace: EvolutionTraceConfig = field(default_factory=EvolutionTraceConfig)
+    reflexion: ReflexionConfig = field(default_factory=ReflexionConfig)
 
     # Evolution settings
     diff_based_evolution: bool = True

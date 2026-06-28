@@ -27,10 +27,6 @@ from openevolve.reflexion import (
     update_stagnation,
 )
 
-
-# --------------------------------------------------------------------------- #
-# Test doubles (boundaries only)
-# --------------------------------------------------------------------------- #
 class StubEnsemble:
     """Stands in for LLMEnsemble at the network boundary."""
 
@@ -58,9 +54,7 @@ def _reflection(text, sys="NEW SYS"):
     return {"island_id": 0, "reflection": text, "new_system_message": sys}
 
 
-# --------------------------------------------------------------------------- #
-# Sprint 3.1 — ReflexionMemory  (T1.2, T1.3, T1.4)
-# --------------------------------------------------------------------------- #
+
 class TestReflexionMemory(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
