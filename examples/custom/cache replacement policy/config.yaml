@@ -20,6 +20,16 @@ llm:
   timeout: 180
   retries: 3
 
+  # Frontier model for the Reflexion layer (separate pool; does NOT inherit the local api settings above)
+  reflexion_models:
+    - name: "deepseek-v4-pro"               # set to your DeepSeek model id (V4 Pro id if available)
+      api_base: "https://api.deepseek.com/v1"
+      api_key: "${DEEPSEEK_API_KEY}"      # resolved from the shell env; `set -a; source .env; set +a` first
+      temperature: 0.7
+      max_tokens: 2048
+      timeout: 180
+      weight: 1.0
+
 prompt:
   num_top_programs: 2            # fewer in-prompt programs → smaller prompt (avoids ctx overflow)
   num_diverse_programs: 1
@@ -62,3 +72,10 @@ evaluator:
   cascade_evaluation: true
   cascade_thresholds: [0.0]      # stage-1 just rejects broken / non-running programs
   parallel_evaluations: 2        # CPU-bound sim; keep modest
+
+reflexion:
+  enabled: true
+  stagnation_patience: 8         # per-island iters w/o combined_score improvement before reflecting
+  memory_size: 3
+  improvement_metric: combined_score
+  # embedding_model: text-embedding-3-small   # optional dedup of reflections (needs an OpenAI key)

@@ -218,6 +218,24 @@ class TestReflexionConfig(unittest.TestCase):
         self.assertEqual(len(cfg.llm.reflexion_models), 1)
         self.assertEqual(cfg.llm.reflexion_models[0].name, "deepseek-v4-pro")
 
+    def test_reflexion_models_get_shared_defaults(self):
+        """Regression: shared params (retries/retry_delay) must backfill onto
+        reflexion_models, else the OpenAI client crashes at `range(retries + 1)`
+        with `None + 1`. Model-specific fields are preserved (not clobbered)."""
+        cfg = Config.from_dict(
+            {
+                "llm": {
+                    "retries": 3,
+                    "reflexion_models": [
+                        {"name": "deepseek-v4-pro", "api_base": "https://api.deepseek.com/v1"}
+                    ],
+                },
+            }
+        )
+        m = cfg.llm.reflexion_models[0]
+        self.assertIsNotNone(m.retries)  # backfilled -> retry loop won't crash
+        self.assertEqual(m.api_base, "https://api.deepseek.com/v1")  # not clobbered
+
 
 # --------------------------------------------------------------------------- #
 # Sprint 5.1 — update_stagnation  (T1.8)

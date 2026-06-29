@@ -335,6 +335,14 @@ class OpenEvolve:
                 file_suffix=self.config.file_suffix,
             )
 
+            # Reflexion layer: stagnation-triggered per-island prompt adaptation (opt-in)
+            if self.config.reflexion.enabled:
+                from openevolve.reflexion import ReflexionOrchestrator
+
+                self.parallel_controller.reflexion = ReflexionOrchestrator(
+                    self.config, output_dir=self.output_dir
+                )
+
             # Set up signal handlers for graceful shutdown
             def signal_handler(signum, frame):
                 logger.info(f"Received signal {signum}, initiating graceful shutdown...")

@@ -18,6 +18,7 @@ from openevolve.llm.ensemble import LLMEnsemble
 
 
 ## todo: change this from a generic message to a specific prompt based on the problem 
+# todo: move to templates file
 REFLEXION_SYSTEM = (
     "You are a senior researcher diagnosing why an automated code-evolution search has "
     "stalled on one island. Read the recent attempts and the current instructions given to "
@@ -82,6 +83,17 @@ def _extract_json(text: Optional[str]) -> Dict[str, Any]:
         return {}
 
 
+def _render_markdown(entries: List[Dict[str, Any]]) -> str:
+    """Render reflections as readable markdown: the diagnosis + the revised prompt per entry."""
+    out = ["# Reflexion log\n", f"_{len(entries)} reflection(s), most recent last._\n"]
+    for i, e in enumerate(entries, 1):
+        out.append(f"\n## {i}. Island {e.get('island_id')}\n")
+        out.append(f"**Diagnosis:** {e.get('reflection', '').strip()}\n")
+        out.append("**Revised system message:**\n")
+        out.append("```\n" + (e.get("new_system_message", "") or "").strip() + "\n```\n")
+    return "\n".join(out)
+
+
 class ReflexionMemory:
     """Bounded list of reflections, persisted as JSON; optional embedding dedup."""
 
@@ -123,6 +135,9 @@ class ReflexionMemory:
             return
         with open(self.path, "w") as f:
             json.dump(self._entries, f)
+        # Human-readable sibling for visual inspection of the verbal gradient.
+        with open(os.path.splitext(self.path)[0] + ".md", "w") as f:
+            f.write(_render_markdown(self._entries))
 
 
 class ReflexionOrchestrator:

@@ -185,7 +185,7 @@ class LLMConfig(LLMModelConfig):
 
     def update_model_params(self, args: Dict[str, Any], overwrite: bool = False) -> None:
         """Update model parameters for all models"""
-        for model in self.models + self.evaluator_models:
+        for model in self.models + self.evaluator_models + self.reflexion_models:
             for key, value in args.items():
                 if overwrite or getattr(model, key, None) is None:
                     setattr(model, key, value)

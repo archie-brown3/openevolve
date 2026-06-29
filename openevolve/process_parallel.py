@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
+from openevolve.reflexion import apply_reflexion_override, update_stagnation
 from openevolve.utils.metrics_utils import safe_numeric_average
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,10 @@ def _run_iteration_worker(
             current_changes_description=parent_changes_desc,
         )
 
+        # Apply this island's Reflexion strategy override for this call only.
+        # Transient: never mutate the persistent worker globals (pooled across islands).
+        prompt = apply_reflexion_override(prompt, db_snapshot.get("reflexion_override"))
+
         iteration_start = time.time()
 
         # Generate code modification (sync wrapper for async)
@@ -352,6 +357,12 @@ class ProcessParallelController:
         self.executor: Optional[ProcessPoolExecutor] = None
         self.shutdown_event = mp.Event()
         self.early_stopping_triggered = False
+
+        # Reflexion layer: set by the controller when config.reflexion.enabled (else stays None)
+        self.reflexion = None
+        self._stagnation_counters: Dict[int, int] = {}
+        self._island_bests: Dict[int, float] = {}
+        self._base_system_message = None  # lazily resolved base prompt for reflection context
 
         # Number of worker processes
         self.num_workers = config.evaluator.parallel_evaluations
@@ -744,6 +755,27 @@ class ProcessParallelController:
                                     self.early_stopping_triggered = True
                                     break
 
+                    # Reflexion: per-island stagnation -> adapt that island's prompt strategy
+                    if self.reflexion is not None and child_program.metrics:
+                        r_score = child_program.metrics.get(
+                            self.config.reflexion.improvement_metric
+                        )
+                        if r_score is None:
+                            r_score = safe_numeric_average(child_program.metrics)
+                        update_stagnation(
+                            self._stagnation_counters,
+                            self._island_bests,
+                            island_id,
+                            r_score,
+                            self.config.convergence_threshold,
+                        )
+                        if (
+                            self._stagnation_counters.get(island_id, 0)
+                            >= self.config.reflexion.stagnation_patience
+                        ):
+                            await self._reflect_on_island(island_id)
+                            self._stagnation_counters[island_id] = 0
+
             except FutureTimeoutError:
                 logger.error(
                     f"⏰ Iteration {completed_iteration} timed out after {timeout_seconds}s "
@@ -793,6 +825,39 @@ class ProcessParallelController:
 
         return self.database.get_best_program()
 
+    def _get_base_system_message(self) -> str:
+        """Resolve the base system prompt text once (context for the reflection model)."""
+        if self._base_system_message is None:
+            from openevolve.prompt.templates import TemplateManager
+
+            key = self.config.prompt.system_message
+            tm = TemplateManager(self.config.prompt.template_dir)
+            try:
+                self._base_system_message = tm.get_template(key)
+            except ValueError:
+                self._base_system_message = key  # not a template name -> treat as literal text
+        return self._base_system_message
+
+    async def _reflect_on_island(self, island_id: int) -> None:
+        """Run a Reflexion pass for a stalled island and store its strategy override.
+        Inline await briefly stalls the harvest loop; acceptable since stagnation is rare."""
+        top = self.database.get_top_programs(n=3, island_idx=island_id)
+        trajectory = [
+            {"changes_description": p.changes_description, "metrics": p.metrics} for p in top
+        ]
+        current = self.database.island_config_overrides.get(island_id, {})
+        base_sys = current.get("system_message") or self._get_base_system_message()
+        result = await self.reflexion.reflect(island_id, trajectory, base_sys)
+        if result.get("system_message"):
+            self.database.island_config_overrides[island_id] = result
+            recent = self.reflexion.memory.recent(1)
+            diagnosis = recent[0].get("reflection", "") if recent else ""
+            logger.info(
+                f"🪞 Reflexion updated island {island_id}'s strategy.\n"
+                f"   Diagnosis: {diagnosis}\n"
+                f"   (full text + revised prompt in reflexion_memory.md)"
+            )
+
     def _submit_iteration(
         self, iteration: int, island_id: Optional[int] = None
     ) -> Optional[Future]:
@@ -810,6 +875,11 @@ class ProcessParallelController:
             # Create database snapshot
             db_snapshot = self._create_database_snapshot()
             db_snapshot["sampling_island"] = target_island  # Mark which island this is for
+
+            # Carry this island's Reflexion strategy override to the worker (if any)
+            override = self.database.island_config_overrides.get(target_island)
+            if override:
+                db_snapshot["reflexion_override"] = override
 
             # Submit to process pool
             future = self.executor.submit(

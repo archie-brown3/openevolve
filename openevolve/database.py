@@ -208,6 +208,10 @@ class ProgramDatabase:
         )
         self.similarity_threshold = config.similarity_threshold
 
+        # Per-island prompting-strategy overrides set by the Reflexion layer
+        # (ephemeral; checkpoint persistence is future work)
+        self.island_config_overrides: Dict[int, Dict[str, Any]] = {}
+
     def add(
         self, program: Program, iteration: int = None, target_island: Optional[int] = None
     ) -> str:
